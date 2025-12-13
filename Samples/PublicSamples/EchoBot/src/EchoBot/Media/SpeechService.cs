@@ -32,6 +32,8 @@ namespace EchoBot.Media
         private readonly AppSettings _settings;
         private readonly string _callId;
         private readonly string _logDirectory;
+        private readonly string _traceLogPath;
+        private readonly object _traceLock = new object();
         private static readonly HttpClient _httpClient = new HttpClient();
         private readonly PushAudioInputStream _audioInputStream = AudioInputStream.CreatePushStream(AudioStreamFormat.GetWaveFormatPCM(16000, 16, 1));
         private readonly AudioOutputStream _audioOutputStream = AudioOutputStream.CreatePullStream();
@@ -50,6 +52,8 @@ namespace EchoBot.Media
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "EchoBot", "speechlogs")
                 : settings.TranscriptionLogDirectory;
             Directory.CreateDirectory(_logDirectory);
+            _traceLogPath = Path.Combine(_logDirectory, $"speechservice-trace-{DateTime.UtcNow:yyyyMMddHHmmss}.log");
+            Trace("SpeechService ctor START");
 
             _speechConfig = SpeechConfig.FromSubscription(settings.SpeechConfigKey, settings.SpeechConfigRegion);
             _speechConfig.SpeechSynthesisLanguage = settings.BotLanguage;
@@ -57,7 +61,7 @@ namespace EchoBot.Media
 
             var audioConfig = AudioConfig.FromStreamOutput(_audioOutputStream);
             _synthesizer = new SpeechSynthesizer(_speechConfig, audioConfig);
-
+            Trace("SpeechService ctor END");
         }
 
         /// <summary>
@@ -66,6 +70,7 @@ namespace EchoBot.Media
         /// <param name="audioBuffer"></param>
         public async Task AppendAudioBuffer(AudioMediaBuffer audioBuffer)
         {
+            Trace($"AppendAudioBuffer START length={audioBuffer?.Length}");
             if (!_isRunning)
             {
                 Start();
@@ -88,14 +93,20 @@ namespace EchoBot.Media
             {
                 _logger.LogError(e, "Exception happend writing to input stream");
             }
+            finally
+            {
+                Trace("AppendAudioBuffer END");
+            }
         }
 
         public virtual void OnSendMediaBufferEventArgs(object sender, MediaStreamEventArgs e)
         {
+            Trace("OnSendMediaBufferEventArgs START");
             if (SendMediaBuffer != null)
             {
                 SendMediaBuffer(this, e);
             }
+            Trace("OnSendMediaBufferEventArgs END");
         }
 
         public event EventHandler<MediaStreamEventArgs> SendMediaBuffer;
@@ -106,8 +117,10 @@ namespace EchoBot.Media
         /// <returns>Task.</returns>
         public async Task ShutDownAsync()
         {
+            Trace("ShutDownAsync START");
             if (!_isRunning)
             {
+                Trace("ShutDownAsync END (not running)");
                 return;
             }
 
@@ -123,6 +136,7 @@ namespace EchoBot.Media
 
                 _isRunning = false;
             }
+            Trace("ShutDownAsync END");
         }
 
         /// <summary>
@@ -130,10 +144,12 @@ namespace EchoBot.Media
         /// </summary>
         private void Start()
         {
+            Trace("Start START");
             if (!_isRunning)
             {
                 _isRunning = true;
             }
+            Trace("Start END");
         }
 
         /// <summary>
@@ -141,6 +157,7 @@ namespace EchoBot.Media
         /// </summary>
         private async Task ProcessSpeech()
         {
+            Trace("ProcessSpeech START");
             try
             {
                 var stopRecognition = new TaskCompletionSource<int>();
@@ -234,10 +251,12 @@ namespace EchoBot.Media
             }
 
             _isDraining = false;
+            Trace("ProcessSpeech END");
         }
 
         private async Task TextToSpeech(string text)
         {
+            Trace($"TextToSpeech START text=\"{text}\"");
             // convert the text to speech
             SpeechSynthesisResult result = await _synthesizer.SpeakTextAsync(text);
             // take the stream of the result
@@ -252,10 +271,12 @@ namespace EchoBot.Media
                 };
                 OnSendMediaBufferEventArgs(this, args);
             }
+            Trace("TextToSpeech END");
         }
 
         private void LogRecognizedText(string text)
         {
+            Trace($"LogRecognizedText START text=\"{text}\"");
             try
             {
                 var file = Path.Combine(_logDirectory, "recognized.txt");
@@ -265,12 +286,18 @@ namespace EchoBot.Media
             {
                 _logger.LogError(ex, "Transcript log write failed.");
             }
+            finally
+            {
+                Trace("LogRecognizedText END");
+            }
         }
 
         private async Task<string?> RelayToVoiceEndpointAsync(string recognizedText)
         {
+            Trace($"RelayToVoiceEndpointAsync START text=\"{recognizedText}\"");
             if (string.IsNullOrWhiteSpace(_settings?.VoiceSttEndpoint))
             {
+                Trace("RelayToVoiceEndpointAsync END (no endpoint)");
                 return null;
             }
 
@@ -293,10 +320,15 @@ namespace EchoBot.Media
                 _logger.LogError(ex, "Failed to call /voice/stt endpoint.");
                 return null;
             }
+            finally
+            {
+                Trace("RelayToVoiceEndpointAsync END");
+            }
         }
 
         private async Task LogVoiceSttResponseAsync(bool success, string body)
         {
+            Trace("LogVoiceSttResponseAsync START");
             try
             {
                 var file = Path.Combine(_logDirectory, "voice-stt-response.txt");
@@ -307,12 +339,18 @@ namespace EchoBot.Media
             {
                 _logger.LogError(ex, "Failed to log /voice/stt response.");
             }
+            finally
+            {
+                Trace("LogVoiceSttResponseAsync END");
+            }
         }
 
         private string? BuildSpeechResponse(string responseBody, string fallbackRecognizedText)
         {
+            Trace("BuildSpeechResponse START");
             if (string.IsNullOrWhiteSpace(responseBody))
             {
+                Trace("BuildSpeechResponse END (empty body)");
                 return null;
             }
 
@@ -390,6 +428,10 @@ namespace EchoBot.Media
                 _logger.LogWarning(ex, "Failed to parse /voice/stt response JSON.");
                 return null;
             }
+            finally
+            {
+                Trace("BuildSpeechResponse END");
+            }
         }
 
         private static string? TryGetString(JsonElement element, string propertyName)
@@ -408,6 +450,23 @@ namespace EchoBot.Media
                 return "your issue";
             }
             return reason;
+        }
+
+        private void Trace(string message)
+        {
+            try
+            {
+                var line = $"{DateTime.UtcNow:u} | {message}";
+                lock (_traceLock)
+                {
+                    File.AppendAllText(_traceLogPath, line + Environment.NewLine);
+                }
+                _logger.LogInformation(line);
+            }
+            catch
+            {
+                // tracing should never throw
+            }
         }
     }
 }
