@@ -54,6 +54,7 @@ namespace EchoBot.Media
             Directory.CreateDirectory(_logDirectory);
             _traceLogPath = Path.Combine(_logDirectory, $"speechservice-trace-{DateTime.UtcNow:yyyyMMddHHmmss}.log");
             Trace("SpeechService ctor START");
+            Trace($"Settings snapshot -> BotLanguage={settings.BotLanguage}, SpeechRegion={settings.SpeechConfigRegion}, VoiceEndpoint={(string.IsNullOrWhiteSpace(settings.VoiceSttEndpoint) ? "<none>" : settings.VoiceSttEndpoint)}, SpeechKeyPresent={(!string.IsNullOrWhiteSpace(settings.SpeechConfigKey))}, UseSpeechService={settings.UseSpeechService}");
 
             _speechConfig = SpeechConfig.FromSubscription(settings.SpeechConfigKey, settings.SpeechConfigRegion);
             _speechConfig.SpeechSynthesisLanguage = settings.BotLanguage;

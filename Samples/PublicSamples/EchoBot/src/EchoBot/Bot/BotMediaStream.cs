@@ -96,10 +96,16 @@ namespace EchoBot.Bot
 
             this._audioSocket.AudioMediaReceived += this.OnAudioMediaReceived;
 
+            _logger.LogInformation($"BotMediaStream settings -> UseSpeechService={_settings.UseSpeechService}, BotLanguage={_settings.BotLanguage}, VoiceEndpoint={(string.IsNullOrWhiteSpace(_settings.VoiceSttEndpoint) ? "<none>" : _settings.VoiceSttEndpoint)}");
+
             if (_settings.UseSpeechService)
             {
                 _languageService = new SpeechService(_settings, _logger, callId);
                 _languageService.SendMediaBuffer += this.OnSendMediaBuffer;
+            }
+            else
+            {
+                _logger.LogWarning("UseSpeechService flag is false. Echo mode will be used and inbound audio will be looped back.");
             }
         }
 
