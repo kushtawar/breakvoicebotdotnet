@@ -20,8 +20,11 @@ using Microsoft.Graph.Communications.Common;
 using Microsoft.Graph.Communications.Common.Telemetry;
 using Microsoft.Skype.Bots.Media;
 using Microsoft.Skype.Internal.Media.Services.Common;
+using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace EchoBot.Bot
 {
@@ -52,6 +55,7 @@ namespace EchoBot.Bot
         private List<AudioMediaBuffer> audioMediaBuffers = new List<AudioMediaBuffer>();
         private int shutdown;
         private readonly SpeechService _languageService;
+        private readonly SemaphoreSlim _playerResetLock = new SemaphoreSlim(1, 1);
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BotMediaStream" /> class.
@@ -102,6 +106,7 @@ namespace EchoBot.Bot
             {
                 _languageService = new SpeechService(_settings, _logger, callId);
                 _languageService.SendMediaBuffer += this.OnSendMediaBuffer;
+                _languageService.StopPlaybackRequested += this.OnStopPlaybackRequested;
             }
             else
             {
@@ -143,6 +148,13 @@ namespace EchoBot.Bot
                 await this.audioVideoFramePlayer.ShutdownAsync().ConfigureAwait(false);
             }
 
+            if (_languageService != null)
+            {
+                _languageService.SendMediaBuffer -= this.OnSendMediaBuffer;
+                _languageService.StopPlaybackRequested -= this.OnStopPlaybackRequested;
+                await _languageService.ShutDownAsync().ConfigureAwait(false);
+            }
+
             // make sure all the audio and video buffers are disposed, it can happen that,
             // the buffers were not enqueued but the call was disposed if the caller hangs up quickly
             foreach (var audioMediaBuffer in this.audioMediaBuffers)
@@ -160,6 +172,19 @@ namespace EchoBot.Bot
         /// </summary>
         /// <returns>Task denoting creation of the player with initial frames enqueued.</returns>
         private async Task StartAudioVideoFramePlayerAsync()
+        {
+            await _playerResetLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await CreateAudioVideoFramePlayerAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _playerResetLock.Release();
+            }
+        }
+
+        private Task CreateAudioVideoFramePlayerAsync()
         {
             try
             {
@@ -180,6 +205,27 @@ namespace EchoBot.Bot
             finally
             {
                 this.startVideoPlayerCompleted.TrySetResult(true);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        private async Task ResetAudioVideoFramePlayerAsync()
+        {
+            await _playerResetLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (this.audioVideoFramePlayer != null)
+                {
+                    await this.audioVideoFramePlayer.ShutdownAsync().ConfigureAwait(false);
+                    this.audioVideoFramePlayer = null;
+                }
+
+                await CreateAudioVideoFramePlayerAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _playerResetLock.Release();
             }
         }
 
@@ -249,7 +295,40 @@ namespace EchoBot.Bot
         private void OnSendMediaBuffer(object? sender, Media.MediaStreamEventArgs e)
         {
             this.audioMediaBuffers = e.AudioMediaBuffers;
-            var result = Task.Run(async () => await this.audioVideoFramePlayer.EnqueueBuffersAsync(this.audioMediaBuffers, new List<VideoMediaBuffer>())).GetAwaiter();
+            var player = this.audioVideoFramePlayer;
+            if (player == null)
+            {
+                DisposeAudioBuffers(this.audioMediaBuffers);
+                return;
+            }
+
+            var result = Task.Run(async () => await player.EnqueueBuffersAsync(this.audioMediaBuffers, new List<VideoMediaBuffer>())).GetAwaiter();
+        }
+
+        private async void OnStopPlaybackRequested(object? sender, EventArgs e)
+        {
+            try
+            {
+                await ResetAudioVideoFramePlayerAsync().ConfigureAwait(false);
+                _logger.LogTrace("Audio player reset after stop request.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to reset audio player after stop request.");
+            }
+        }
+
+        private static void DisposeAudioBuffers(IEnumerable<AudioMediaBuffer> buffers)
+        {
+            if (buffers == null)
+            {
+                return;
+            }
+
+            foreach (var buffer in buffers)
+            {
+                buffer?.Dispose();
+            }
         }
     }
 }

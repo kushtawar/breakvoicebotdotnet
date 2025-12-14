@@ -2,11 +2,15 @@
 using Microsoft.CognitiveServices.Speech.Audio;
 using Microsoft.Skype.Bots.Media;
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace EchoBot.Media
@@ -41,6 +45,46 @@ namespace EchoBot.Media
         private readonly SpeechConfig _speechConfig;
         private SpeechRecognizer _recognizer;
         private readonly SpeechSynthesizer _synthesizer;
+        private readonly object _speechStateLock = new object();
+        private CancellationTokenSource _currentSpeechCts;
+        private bool _isSpeaking;
+        private long _bufferSampleCount;
+        private long _bufferSampleBytes;
+        private readonly object _bufferLogLock = new object();
+        private DateTime _bufferWindowStartUtc = DateTime.UtcNow;
+        private readonly TimeSpan _bufferLogInterval = TimeSpan.FromSeconds(5);
+        private DateTime _lastProcessingPromptUtc = DateTime.MinValue;
+        private const int AudioChunkTickSpan = 20 * 10000;
+        private static readonly string[] StopKeywords = new[]
+        {
+            "listen to me",
+            "just listen",
+            "stop talking",
+            "stop speaking",
+            "stop please",
+            "be quiet",
+            "listen now",
+            "listen up"
+        };
+        private static readonly HashSet<string> StopSingleWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "stop",
+            "listen"
+        };
+        private static readonly string[] SnowHintKeywords = new[]
+        {
+            "ticket",
+            "incident",
+            "internet",
+            "network",
+            "vpn",
+            "status of",
+            "status for"
+        };
+        private static readonly Regex SentenceSplitRegex = new Regex(@"(?<=[\.!\?])\s+", RegexOptions.Compiled);
+
+        public event EventHandler? StopPlaybackRequested;
+
         /// <summary>
         /// Initializes a new instance of the <see cref="SpeechService" /> class.
         public SpeechService(AppSettings settings, ILogger logger, string callId)
@@ -71,7 +115,7 @@ namespace EchoBot.Media
         /// <param name="audioBuffer"></param>
         public async Task AppendAudioBuffer(AudioMediaBuffer audioBuffer)
         {
-            Trace($"AppendAudioBuffer START length={audioBuffer?.Length}");
+            MaybeLogBufferSample((int)(audioBuffer?.Length ?? 0));
             if (!_isRunning)
             {
                 Start();
@@ -94,20 +138,11 @@ namespace EchoBot.Media
             {
                 _logger.LogError(e, "Exception happend writing to input stream");
             }
-            finally
-            {
-                Trace("AppendAudioBuffer END");
-            }
         }
 
         public virtual void OnSendMediaBufferEventArgs(object sender, MediaStreamEventArgs e)
         {
-            Trace("OnSendMediaBufferEventArgs START");
-            if (SendMediaBuffer != null)
-            {
-                SendMediaBuffer(this, e);
-            }
-            Trace("OnSendMediaBufferEventArgs END");
+            SendMediaBuffer?.Invoke(this, e);
         }
 
         public event EventHandler<MediaStreamEventArgs> SendMediaBuffer;
@@ -119,6 +154,7 @@ namespace EchoBot.Media
         public async Task ShutDownAsync()
         {
             Trace("ShutDownAsync START");
+            CancelCurrentSpeech("shutdown");
             if (!_isRunning)
             {
                 Trace("ShutDownAsync END (not running)");
@@ -184,10 +220,25 @@ namespace EchoBot.Media
                         if (string.IsNullOrEmpty(e.Result.Text))
                             return;
 
-                        _logger.LogInformation($"RECOGNIZED: Text={e.Result.Text}");
-                        LogRecognizedText(e.Result.Text);
-                        var responseBody = await RelayToVoiceEndpointAsync(e.Result.Text);
-                        var speechText = e.Result.Text;
+                        var recognizedText = e.Result.Text.Trim();
+                        _logger.LogInformation($"RECOGNIZED: Text={recognizedText}");
+                        LogRecognizedText(recognizedText);
+
+                        if (IsStopCommand(recognizedText))
+                        {
+                            await HandleStopCommandAsync();
+                            return;
+                        }
+
+                        if (_isSpeaking)
+                        {
+                            CancelCurrentSpeech("incoming user speech");
+                        }
+
+                        await PlayProcessingPromptAsync(recognizedText);
+
+                        var responseBody = await RelayToVoiceEndpointAsync(recognizedText);
+                        var speechText = recognizedText;
                         if (!string.IsNullOrWhiteSpace(responseBody))
                         {
                             var formatted = BuildSpeechResponse(responseBody, speechText);
@@ -196,6 +247,7 @@ namespace EchoBot.Media
                                 speechText = formatted;
                             }
                         }
+                        speechText = ShortenResponse(speechText);
                         await TextToSpeech(speechText);
                     }
                     else if (e.Result.Reason == ResultReason.NoMatch)
@@ -220,7 +272,7 @@ namespace EchoBot.Media
 
                 _recognizer.SessionStarted += async (s, e) =>
                 {
-                    _logger.LogInformation("\nSession started event.");
+                _logger.LogInformation("\nSession started event.");
                     await TextToSpeech("Hello");
                 };
 
@@ -258,21 +310,73 @@ namespace EchoBot.Media
         private async Task TextToSpeech(string text)
         {
             Trace($"TextToSpeech START text=\"{text}\"");
-            // convert the text to speech
-            SpeechSynthesisResult result = await _synthesizer.SpeakTextAsync(text);
-            // take the stream of the result
-            // create 20ms media buffers of the stream
-            // and send to the AudioSocket in the BotMediaStream
-            using (var stream = AudioDataStream.FromResult(result))
+            if (string.IsNullOrWhiteSpace(text))
             {
-                var currentTick = DateTime.Now.Ticks;
-                MediaStreamEventArgs args = new MediaStreamEventArgs
-                {
-                    AudioMediaBuffers = Util.Utilities.CreateAudioMediaBuffers(stream, currentTick, _logger)
-                };
-                OnSendMediaBufferEventArgs(this, args);
+                Trace("TextToSpeech END (empty text)");
+                return;
             }
-            Trace("TextToSpeech END");
+
+            CancellationTokenSource speechCts;
+            lock (_speechStateLock)
+            {
+                _currentSpeechCts = new CancellationTokenSource();
+                speechCts = _currentSpeechCts;
+                _isSpeaking = true;
+            }
+
+            try
+            {
+                using var result = await _synthesizer.SpeakTextAsync(text);
+                using var stream = AudioDataStream.FromResult(result);
+                stream.SetPosition(44);
+                var chunk = new byte[640];
+                var chunkIndex = 0;
+                var referenceBase = DateTime.Now.Ticks;
+                while (!speechCts.Token.IsCancellationRequested)
+                {
+                    var read = stream.ReadData(chunk);
+                    if (read < 640)
+                    {
+                        break;
+                    }
+
+                    var payload = new byte[640];
+                    Buffer.BlockCopy(chunk, 0, payload, 0, 640);
+                    var referenceTick = referenceBase + (chunkIndex * AudioChunkTickSpan);
+                    var buffers = Util.Utilities.CreateAudioMediaBuffers(payload, referenceTick, _logger);
+                    if (buffers?.Count > 0)
+                    {
+                        chunkIndex += buffers.Count;
+                        var args = new MediaStreamEventArgs
+                        {
+                            AudioMediaBuffers = buffers
+                        };
+                        OnSendMediaBufferEventArgs(this, args);
+                    }
+                    else
+                    {
+                        chunkIndex++;
+                    }
+                }
+
+                if (speechCts.Token.IsCancellationRequested)
+                {
+                    Trace("TextToSpeech cancelled");
+                }
+            }
+            finally
+            {
+                lock (_speechStateLock)
+                {
+                    if (_currentSpeechCts == speechCts)
+                    {
+                        _currentSpeechCts.Dispose();
+                        _currentSpeechCts = null;
+                        _isSpeaking = false;
+                    }
+                }
+                Trace("TextToSpeech END");
+            }
         }
 
         private void LogRecognizedText(string text)
@@ -468,6 +572,97 @@ namespace EchoBot.Media
             {
                 // tracing should never throw
             }
+        }
+
+        private void MaybeLogBufferSample(int length)
+        {
+            lock (_bufferLogLock)
+            {
+                _bufferSampleCount++;
+                _bufferSampleBytes += length;
+                var now = DateTime.UtcNow;
+                if ((now - _bufferWindowStartUtc) >= _bufferLogInterval)
+                {
+                    var windowSeconds = (now - _bufferWindowStartUtc).TotalSeconds;
+                    Trace($"AppendAudioBuffer summary -> chunks={_bufferSampleCount} bytes={_bufferSampleBytes} window={windowSeconds:F1}s");
+                    _bufferWindowStartUtc = now;
+                    _bufferSampleCount = 0;
+                    _bufferSampleBytes = 0;
+                }
+            }
+        }
+
+        private bool IsStopCommand(string text)
+        {
+            var lower = text.Trim().ToLowerInvariant();
+            if (StopKeywords.Any(k => lower.Contains(k)))
+            {
+                return true;
+            }
+
+            return StopSingleWords.Contains(lower);
+        }
+
+        private async Task HandleStopCommandAsync()
+        {
+            CancelCurrentSpeech("explicit stop command");
+            await TextToSpeech("OK, I'm listening to you.");
+        }
+
+        private void CancelCurrentSpeech(string reason)
+        {
+            CancellationTokenSource cts = null;
+            lock (_speechStateLock)
+            {
+                cts = _currentSpeechCts;
+            }
+
+            if (cts != null && !cts.IsCancellationRequested)
+            {
+                Trace($"Cancelling speech playback ({reason})");
+                cts.Cancel();
+                StopPlaybackRequested?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        private async Task PlayProcessingPromptAsync(string recognizedText)
+        {
+            if (!ShouldPlayProcessingPrompt(recognizedText))
+            {
+                return;
+            }
+
+            var now = DateTime.UtcNow;
+            if ((now - _lastProcessingPromptUtc) < TimeSpan.FromSeconds(3))
+            {
+                return;
+            }
+
+            _lastProcessingPromptUtc = now;
+            await TextToSpeech("Please hold on while I complete your request.");
+        }
+
+        private bool ShouldPlayProcessingPrompt(string recognizedText)
+        {
+            var lower = recognizedText.ToLowerInvariant();
+            return SnowHintKeywords.Any(k => lower.Contains(k));
+        }
+
+        private static string ShortenResponse(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+
+            var trimmed = text.Trim();
+            var parts = SentenceSplitRegex.Split(trimmed);
+            if (parts.Length <= 2)
+            {
+                return trimmed.Length > 320 ? $"{trimmed.Substring(0, 320).Trim()}…" : trimmed;
+            }
+
+            return string.Join(" ", parts.Take(2)).Trim();
         }
     }
 }
