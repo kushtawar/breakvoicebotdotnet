@@ -35,12 +35,19 @@ namespace EchoBot.Media
         private readonly string _traceLogPath;
         private readonly object _traceLock = new object();
         private static readonly HttpClient _httpClient = new HttpClient();
+        static SpeechService()
+        {
+            _httpClient.Timeout = TimeSpan.FromSeconds(60);
+        }
         private readonly PushAudioInputStream _audioInputStream = AudioInputStream.CreatePushStream(AudioStreamFormat.GetWaveFormatPCM(16000, 16, 1));
         private readonly AudioOutputStream _audioOutputStream = AudioOutputStream.CreatePullStream();
 
         private readonly SpeechConfig _speechConfig;
         private SpeechRecognizer _recognizer;
+        private AudioConfig _audioInputConfig;
+        private bool _recognizerStarted;
         private readonly SpeechSynthesizer _synthesizer;
+        private const string DefaultProcessingHint = "Please hold while I check ServiceNow.";
         private long _bufferSampleCount;
         private long _bufferSampleBytes;
         private readonly object _bufferLogLock = new object();
@@ -128,8 +135,12 @@ namespace EchoBot.Media
 
             if (_isRunning)
             {
-                await _recognizer.StopContinuousRecognitionAsync();
-                _recognizer.Dispose();
+                if (_recognizerStarted)
+                {
+                    await _recognizer.StopContinuousRecognitionAsync();
+                    _recognizerStarted = false;
+                }
+                _recognizer?.Dispose();
                 _audioInputStream.Close();
 
                 _audioInputStream.Dispose();
@@ -162,85 +173,97 @@ namespace EchoBot.Media
             Trace("ProcessSpeech START");
             try
             {
-                var stopRecognition = new TaskCompletionSource<int>();
-
-                using (var audioInput = AudioConfig.FromStreamInput(_audioInputStream))
+                if (_recognizer == null)
                 {
-                    if (_recognizer == null)
+                    _logger.LogInformation("init recognizer");
+                    _audioInputConfig = AudioConfig.FromStreamInput(_audioInputStream);
+                    _recognizer = new SpeechRecognizer(_speechConfig, _audioInputConfig);
+
+                    _recognizer.Recognizing += (s, e) =>
                     {
-                        _logger.LogInformation("init recognizer");
-                        _recognizer = new SpeechRecognizer(_speechConfig, audioInput);
-                    }
+                        _logger.LogInformation($"RECOGNIZING: Text={e.Result.Text}");
+                    };
+
+                    _recognizer.Recognized += async (s, e) =>
+                    {
+                        if (e.Result.Reason == ResultReason.RecognizedSpeech)
+                        {
+                            var recognizedText = e.Result.Text;
+                            if (string.IsNullOrWhiteSpace(recognizedText))
+                                return;
+
+                            _logger.LogInformation($"RECOGNIZED: Text={recognizedText}");
+                            LogRecognizedText(recognizedText);
+
+                            var holdPromptSpoken = false;
+                            if (RequiresSnowIntent(recognizedText))
+                            {
+                                await TextToSpeech(DefaultProcessingHint);
+                                holdPromptSpoken = true;
+                            }
+
+                            var responseBody = await RelayToVoiceEndpointAsync(recognizedText);
+                            var speechText = recognizedText;
+                            bool longRunning;
+                            string processingHint;
+                            longRunning = false;
+                            processingHint = null;
+                            if (!string.IsNullOrWhiteSpace(responseBody))
+                            {
+                                var formatted = BuildSpeechResponse(responseBody, speechText, out longRunning, out processingHint);
+                                if (!string.IsNullOrWhiteSpace(formatted))
+                                {
+                                    speechText = formatted;
+                                }
+                            }
+
+                            if (longRunning && !holdPromptSpoken)
+                            {
+                                var hint = string.IsNullOrWhiteSpace(processingHint) ? DefaultProcessingHint : processingHint;
+                                await TextToSpeech(hint);
+                                holdPromptSpoken = true;
+                            }
+
+                            await TextToSpeech(speechText);
+                        }
+                        else if (e.Result.Reason == ResultReason.NoMatch)
+                        {
+                            _logger.LogInformation("NOMATCH: Speech could not be recognized.");
+                        }
+                    };
+
+                    _recognizer.Canceled += (s, e) =>
+                    {
+                        _logger.LogInformation($"CANCELED: Reason={e.Reason}");
+
+                        if (e.Reason == CancellationReason.Error)
+                        {
+                            _logger.LogInformation($"CANCELED: ErrorCode={e.ErrorCode}");
+                            _logger.LogInformation($"CANCELED: ErrorDetails={e.ErrorDetails}");
+                            _logger.LogInformation("CANCELED: Did you update the subscription info?");
+                        }
+
+                        _recognizerStarted = false;
+                    };
+
+                    _recognizer.SessionStarted += async (s, e) =>
+                    {
+                        _logger.LogInformation("\nSession started event.");
+                        await TextToSpeech("Hello");
+                    };
+
+                    _recognizer.SessionStopped += (s, e) =>
+                    {
+                        _logger.LogInformation("\nSession stopped event.");
+                        _recognizerStarted = false;
+                    };
                 }
 
-                _recognizer.Recognizing += (s, e) =>
+                if (!_recognizerStarted)
                 {
-                    _logger.LogInformation($"RECOGNIZING: Text={e.Result.Text}");
-                };
-
-                _recognizer.Recognized += async (s, e) =>
-                {
-                    if (e.Result.Reason == ResultReason.RecognizedSpeech)
-                    {
-                        if (string.IsNullOrEmpty(e.Result.Text))
-                            return;
-
-                        _logger.LogInformation($"RECOGNIZED: Text={e.Result.Text}");
-                        LogRecognizedText(e.Result.Text);
-                        var responseBody = await RelayToVoiceEndpointAsync(e.Result.Text);
-                        var speechText = e.Result.Text;
-                        if (!string.IsNullOrWhiteSpace(responseBody))
-                        {
-                            var formatted = BuildSpeechResponse(responseBody, speechText);
-                            if (!string.IsNullOrWhiteSpace(formatted))
-                            {
-                                speechText = formatted;
-                            }
-                        }
-                        await TextToSpeech(speechText);
-                    }
-                    else if (e.Result.Reason == ResultReason.NoMatch)
-                    {
-                        _logger.LogInformation($"NOMATCH: Speech could not be recognized.");
-                    }
-                };
-
-                _recognizer.Canceled += (s, e) =>
-                {
-                    _logger.LogInformation($"CANCELED: Reason={e.Reason}");
-
-                    if (e.Reason == CancellationReason.Error)
-                    {
-                        _logger.LogInformation($"CANCELED: ErrorCode={e.ErrorCode}");
-                        _logger.LogInformation($"CANCELED: ErrorDetails={e.ErrorDetails}");
-                        _logger.LogInformation($"CANCELED: Did you update the subscription info?");
-                    }
-
-                    stopRecognition.TrySetResult(0);
-                };
-
-                _recognizer.SessionStarted += async (s, e) =>
-                {
-                    _logger.LogInformation("\nSession started event.");
-                    await TextToSpeech("Hello");
-                };
-
-                _recognizer.SessionStopped += (s, e) =>
-                {
-                    _logger.LogInformation("\nSession stopped event.");
-                    _logger.LogInformation("\nStop recognition.");
-                    stopRecognition.TrySetResult(0);
-                };
-
-                // Starts continuous recognition. Uses StopContinuousRecognitionAsync() to stop recognition.
-                await _recognizer.StartContinuousRecognitionAsync().ConfigureAwait(false);
-
-                // Waits for completion.
-                // Use Task.WaitAny to keep the task rooted.
-                Task.WaitAny(new[] { stopRecognition.Task });
-
-                // Stops recognition.
-                await _recognizer.StopContinuousRecognitionAsync().ConfigureAwait(false);
+                    await _recognizer.StartContinuousRecognitionAsync().ConfigureAwait(false);
+                    _recognizerStarted = true;
+                }
             }
             catch (ObjectDisposedException ex)
             {
@@ -347,9 +370,11 @@ namespace EchoBot.Media
             }
         }
 
-        private string? BuildSpeechResponse(string responseBody, string fallbackRecognizedText)
+        private string? BuildSpeechResponse(string responseBody, string fallbackRecognizedText, out bool longRunning, out string processingHint)
         {
             Trace("BuildSpeechResponse START");
+            longRunning = false;
+            processingHint = null;
             if (string.IsNullOrWhiteSpace(responseBody))
             {
                 Trace("BuildSpeechResponse END (empty body)");
@@ -362,6 +387,12 @@ namespace EchoBot.Media
                 if (!doc.RootElement.TryGetProperty("result", out var resultElement))
                 {
                     return null;
+                }
+
+                if (resultElement.TryGetProperty("long_running", out var longRunningElement) && longRunningElement.ValueKind == JsonValueKind.True)
+                {
+                    longRunning = true;
+                    processingHint = TryGetString(resultElement, "processing_hint") ?? DefaultProcessingHint;
                 }
 
                 var action = TryGetString(resultElement, "action")?.ToLowerInvariant();
@@ -403,6 +434,7 @@ namespace EchoBot.Media
                     case "help":
                     case "bot_profile":
                     case "ticket_howto":
+                    case "direct_reply":
                         var reply = TryGetString(resultElement, "text");
                         return string.IsNullOrWhiteSpace(reply) ? fallbackRecognizedText : reply;
 
@@ -486,6 +518,30 @@ namespace EchoBot.Media
                     _bufferSampleBytes = 0;
                 }
             }
+        }
+
+        private static bool RequiresSnowIntent(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            var lower = text.ToLowerInvariant();
+            if (lower.Contains("ticket") || lower.Contains("incident") || lower.Contains("status of"))
+            {
+                return true;
+            }
+            if (lower.Contains("servicenow"))
+            {
+                return true;
+            }
+            if (lower.Contains("vpn") || lower.Contains("password"))
+            {
+                return true;
+            }
+
+            return false;
         }
     }
 }
