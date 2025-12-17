@@ -48,6 +48,9 @@ namespace EchoBot.Media
         private bool _recognizerStarted;
         private readonly SpeechSynthesizer _synthesizer;
         private const string DefaultProcessingHint = "Please hold while I check ServiceNow.";
+        private Task _speechLoopTask;
+        private TaskCompletionSource<bool> _shutdownSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private TaskCompletionSource<bool> _restartSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private long _bufferSampleCount;
         private long _bufferSampleBytes;
         private readonly object _bufferLogLock = new object();
@@ -81,12 +84,11 @@ namespace EchoBot.Media
         /// Appends the audio buffer.
         /// </summary>
         /// <param name="audioBuffer"></param>
-        public async Task AppendAudioBuffer(AudioMediaBuffer audioBuffer)
+        public Task AppendAudioBuffer(AudioMediaBuffer audioBuffer)
         {
             if (!_isRunning)
             {
                 Start();
-                await ProcessSpeech();
             }
 
             try
@@ -106,6 +108,8 @@ namespace EchoBot.Media
             {
                 _logger.LogError(e, "Exception happend writing to input stream");
             }
+
+            return Task.CompletedTask;
         }
 
         public virtual void OnSendMediaBufferEventArgs(object sender, MediaStreamEventArgs e)
@@ -133,22 +137,19 @@ namespace EchoBot.Media
                 return;
             }
 
-            if (_isRunning)
+            _shutdownSignal.TrySetResult(true);
+            if (_speechLoopTask != null)
             {
-                if (_recognizerStarted)
-                {
-                    await _recognizer.StopContinuousRecognitionAsync();
-                    _recognizerStarted = false;
-                }
-                _recognizer?.Dispose();
-                _audioInputStream.Close();
-
-                _audioInputStream.Dispose();
-                _audioOutputStream.Dispose();
-                _synthesizer.Dispose();
-
-                _isRunning = false;
+                await _speechLoopTask.ConfigureAwait(false);
+                _speechLoopTask = null;
             }
+
+            _audioInputStream.Close();
+            _audioInputStream.Dispose();
+            _audioOutputStream.Dispose();
+            _synthesizer.Dispose();
+
+            _isRunning = false;
             Trace("ShutDownAsync END");
         }
 
@@ -158,19 +159,51 @@ namespace EchoBot.Media
         private void Start()
         {
             Trace("Start START");
-            if (!_isRunning)
+            if (_isRunning)
             {
-                _isRunning = true;
+                Trace("Start END (already running)");
+                return;
             }
+
+            _isRunning = true;
+            _shutdownSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _restartSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _speechLoopTask = Task.Run(ProcessSpeechLoopAsync);
             Trace("Start END");
         }
 
-        /// <summary>
-        /// Processes this instance.
-        /// </summary>
-        private async Task ProcessSpeech()
+        private async Task ProcessSpeechLoopAsync()
         {
-            Trace("ProcessSpeech START");
+            Trace("ProcessSpeechLoopAsync START");
+            try
+            {
+                while (!_shutdownSignal.Task.IsCompleted)
+                {
+                    await EnsureRecognizerRunningAsync().ConfigureAwait(false);
+
+                    var completedTask = await Task.WhenAny(_shutdownSignal.Task, _restartSignal.Task).ConfigureAwait(false);
+                    if (completedTask == _shutdownSignal.Task)
+                    {
+                        break;
+                    }
+
+                    _restartSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    await ResetRecognizerAsync().ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "ProcessSpeechLoopAsync faulted.");
+            }
+            finally
+            {
+                await ResetRecognizerAsync().ConfigureAwait(false);
+                Trace("ProcessSpeechLoopAsync END");
+            }
+        }
+
+        private async Task EnsureRecognizerRunningAsync()
+        {
             try
             {
                 if (_recognizer == null)
@@ -244,6 +277,7 @@ namespace EchoBot.Media
                         }
 
                         _recognizerStarted = false;
+                        RequestRecognizerRestart("Canceled");
                     };
 
                     _recognizer.SessionStarted += async (s, e) =>
@@ -256,10 +290,11 @@ namespace EchoBot.Media
                     {
                         _logger.LogInformation("\nSession stopped event.");
                         _recognizerStarted = false;
+                        RequestRecognizerRestart("SessionStopped");
                     };
                 }
 
-                if (!_recognizerStarted)
+                if (!_recognizerStarted && _recognizer != null)
                 {
                     await _recognizer.StartContinuousRecognitionAsync().ConfigureAwait(false);
                     _recognizerStarted = true;
@@ -271,12 +306,45 @@ namespace EchoBot.Media
             }
             catch (Exception ex)
             {
-                // Catch all other exceptions and log
-                _logger.LogError(ex, "Caught Exception");
+                _logger.LogError(ex, "Caught Exception while ensuring recognizer");
+                RequestRecognizerRestart("EnsureRecognizerRunningAsync Exception");
             }
+        }
 
-            _isDraining = false;
-            Trace("ProcessSpeech END");
+        private async Task ResetRecognizerAsync()
+        {
+            try
+            {
+                if (_recognizer != null)
+                {
+                    if (_recognizerStarted)
+                    {
+                        try
+                        {
+                            await _recognizer.StopContinuousRecognitionAsync().ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to stop recognizer during reset.");
+                        }
+                    }
+
+                    _recognizer.Dispose();
+                    _recognizer = null;
+                    _recognizerStarted = false;
+                }
+            }
+            finally
+            {
+                _audioInputConfig?.Dispose();
+                _audioInputConfig = null;
+            }
+        }
+
+        private void RequestRecognizerRestart(string reason)
+        {
+            Trace($"Recognizer restart requested ({reason})");
+            _restartSignal.TrySetResult(true);
         }
 
         private async Task TextToSpeech(string text)
