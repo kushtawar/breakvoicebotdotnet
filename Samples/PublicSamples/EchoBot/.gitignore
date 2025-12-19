@@ -351,3 +351,7 @@ MigrationBackup/
 .env
 
 .DS_Store
+# local secrets / automation
+answers.txt
+Samples/PublicSamples/EchoBot/answers.txt
+*.pfx
