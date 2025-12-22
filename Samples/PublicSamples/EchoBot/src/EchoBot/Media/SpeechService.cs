@@ -67,6 +67,8 @@ namespace EchoBot.Media
         private DateTime _lastRestartRequestUtc = DateTime.MinValue;
         private volatile bool _suppressInput;
         private readonly SemaphoreSlim _ttsLock = new(1, 1);
+        private readonly object _lastSpokenLock = new();
+        private string? _lastSpokenText;
         private readonly object _dictationLock = new();
         private DictationState _dictationState = DictationState.Idle;
         private DateTime _dictationStartUtc;
@@ -92,6 +94,7 @@ namespace EchoBot.Media
         private const string DictationDiscardPrompt = "Okay. Discarding the note.";
         private const string DictationTooShortPrompt = "Please continue for a few more seconds.";
         private const string DictationTranscribeFailedPrompt = "I couldn't transcribe this note. Please retry.";
+        private const string RepeatMissingPrompt = "I don't have a previous message to repeat.";
         /// <summary>
         /// Initializes a new instance of the <see cref="SpeechService" /> class.
         public SpeechService(AppSettings settings, ILogger logger, string callId)
@@ -463,6 +466,7 @@ namespace EchoBot.Media
                     };
                     OnSendMediaBufferEventArgs(this, args);
                 }
+                StoreLastSpoken(text);
             }
             finally
             {
@@ -625,6 +629,9 @@ namespace EchoBot.Media
                         return string.IsNullOrWhiteSpace(legacy)
                             ? $"You said: {fallbackRecognizedText}"
                             : $"You said: {legacy}";
+
+                    case "repeat_last":
+                        return GetLastSpokenOrFallback();
 
                     default:
                         return null;
@@ -920,6 +927,27 @@ namespace EchoBot.Media
                 return "your issue";
             }
             return reason;
+        }
+
+        private string GetLastSpokenOrFallback()
+        {
+            lock (_lastSpokenLock)
+            {
+                return string.IsNullOrWhiteSpace(_lastSpokenText) ? RepeatMissingPrompt : _lastSpokenText;
+            }
+        }
+
+        private void StoreLastSpoken(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return;
+            }
+
+            lock (_lastSpokenLock)
+            {
+                _lastSpokenText = text.Trim();
+            }
         }
 
         private void Trace(string message)
