@@ -51,6 +51,8 @@ namespace EchoBot.Media
         private readonly SpeechSynthesizer _synthesizer;
         private string _currentVoiceLang = string.Empty;
         private const string DefaultProcessingHint = "Please hold while I check ServiceNow.";
+        private const string AzureAdProcessingHint = "Please hold while I check Azure Active Directory.";
+        private const string IntuneProcessingHint = "Please hold while I check Microsoft Intune.";
         private Task _speechLoopTask;
         private TaskCompletionSource<bool> _shutdownSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private TaskCompletionSource<bool> _restartSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -287,9 +289,10 @@ namespace EchoBot.Media
                             }
 
                             var holdPromptSpoken = false;
-                            if (RequiresSnowIntent(recognizedText))
+                            var preemptiveHint = TryGetPreemptiveHoldPrompt(recognizedText);
+                            if (!string.IsNullOrWhiteSpace(preemptiveHint))
                             {
-                                await TextToSpeech(DefaultProcessingHint);
+                                await TextToSpeech(preemptiveHint);
                                 holdPromptSpoken = true;
                             }
 
@@ -681,6 +684,48 @@ namespace EchoBot.Media
             }
         }
 
+        private static string? TryGetPreemptiveHoldPrompt(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return null;
+            }
+
+            var lower = text.ToLowerInvariant();
+            if (
+                lower.Contains("intune")
+                || lower.Contains("device compliance")
+                || lower.Contains("managed device")
+                || lower.Contains("compliance report")
+                || lower.Contains("last check-in")
+            )
+            {
+                return IntuneProcessingHint;
+            }
+            if (
+                lower.Contains("entra")
+                || lower.Contains("azure ad")
+                || lower.Contains("active directory")
+                || lower.Contains("aad")
+            )
+            {
+                return AzureAdProcessingHint;
+            }
+            if (
+                lower.Contains("ticket")
+                || lower.Contains("incident")
+                || lower.Contains("status of")
+                || lower.Contains("servicenow")
+                || lower.Contains("vpn")
+                || lower.Contains("password")
+            )
+            {
+                return DefaultProcessingHint;
+            }
+
+            return null;
+        }
+
         private enum DictationState
         {
             Idle,
@@ -1026,28 +1071,5 @@ namespace EchoBot.Media
             }
         }
 
-        private static bool RequiresSnowIntent(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text))
-            {
-                return false;
-            }
-
-            var lower = text.ToLowerInvariant();
-            if (lower.Contains("ticket") || lower.Contains("incident") || lower.Contains("status of"))
-            {
-                return true;
-            }
-            if (lower.Contains("servicenow"))
-            {
-                return true;
-            }
-            if (lower.Contains("vpn") || lower.Contains("password"))
-            {
-                return true;
-            }
-
-            return false;
-        }
     }
 }
