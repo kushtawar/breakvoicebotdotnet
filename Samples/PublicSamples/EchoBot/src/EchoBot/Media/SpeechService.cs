@@ -342,6 +342,7 @@ namespace EchoBot.Media
                 {
                     _logger.LogInformation($"CANCELED: ErrorCode={e.ErrorCode}");
                     _logger.LogInformation($"CANCELED: ErrorDetails={e.ErrorDetails}");
+                    Trace($"Recognizer canceled details -> ErrorCode={e.ErrorCode}, ErrorDetails={e.ErrorDetails}");
                             _logger.LogInformation("CANCELED: Did you update the subscription info?");
                         }
 
