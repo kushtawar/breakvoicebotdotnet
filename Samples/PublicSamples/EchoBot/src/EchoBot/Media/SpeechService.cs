@@ -714,6 +714,9 @@ namespace EchoBot.Media
                 || lower.Contains("azure ad")
                 || lower.Contains("active directory")
                 || lower.Contains("aad")
+                || lower.Contains("password")
+                || lower.Contains("reset my password")
+                || lower.Contains("password reset")
             )
             {
                 return AzureAdProcessingHint;
@@ -724,7 +727,6 @@ namespace EchoBot.Media
                 || lower.Contains("status of")
                 || lower.Contains("servicenow")
                 || lower.Contains("vpn")
-                || lower.Contains("password")
             )
             {
                 return DefaultProcessingHint;
