@@ -53,6 +53,12 @@ namespace EchoBot.Media
         private const string DefaultProcessingHint = "Please hold while I check ServiceNow.";
         private const string AzureAdProcessingHint = "Please hold while I check Azure Active Directory.";
         private const string IntuneProcessingHint = "Please hold while I check Microsoft Intune.";
+        private const string DefaultProcessingHintDe = "Bitte warten, während ich ServiceNow prüfe.";
+        private const string AzureAdProcessingHintDe = "Bitte warten, während ich Azure Active Directory prüfe.";
+        private const string IntuneProcessingHintDe = "Bitte warten, während ich Microsoft Intune prüfe.";
+        private const string DefaultProcessingHintEs = "Por favor espera mientras reviso ServiceNow.";
+        private const string AzureAdProcessingHintEs = "Por favor espera mientras reviso Azure Active Directory.";
+        private const string IntuneProcessingHintEs = "Por favor espera mientras reviso Microsoft Intune.";
         private Task _speechLoopTask;
         private TaskCompletionSource<bool> _shutdownSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private TaskCompletionSource<bool> _restartSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -292,7 +298,7 @@ namespace EchoBot.Media
                             var preemptiveHint = TryGetPreemptiveHoldPrompt(recognizedText);
                             if (!string.IsNullOrWhiteSpace(preemptiveHint))
                             {
-                                await TextToSpeech(preemptiveHint);
+                                await TextToSpeech(LocalizeHoldPrompt(preemptiveHint));
                                 holdPromptSpoken = true;
                             }
 
@@ -725,6 +731,42 @@ namespace EchoBot.Media
             }
 
             return null;
+        }
+
+        private string LocalizeHoldPrompt(string prompt)
+        {
+            if (string.IsNullOrWhiteSpace(prompt))
+            {
+                return prompt;
+            }
+
+            var lang = (_currentVoiceLang ?? string.Empty).ToLowerInvariant();
+            if (lang.StartsWith("de"))
+            {
+                if (prompt == AzureAdProcessingHint)
+                {
+                    return AzureAdProcessingHintDe;
+                }
+                if (prompt == IntuneProcessingHint)
+                {
+                    return IntuneProcessingHintDe;
+                }
+                return DefaultProcessingHintDe;
+            }
+            if (lang.StartsWith("es"))
+            {
+                if (prompt == AzureAdProcessingHint)
+                {
+                    return AzureAdProcessingHintEs;
+                }
+                if (prompt == IntuneProcessingHint)
+                {
+                    return IntuneProcessingHintEs;
+                }
+                return DefaultProcessingHintEs;
+            }
+
+            return prompt;
         }
 
         private enum DictationState
