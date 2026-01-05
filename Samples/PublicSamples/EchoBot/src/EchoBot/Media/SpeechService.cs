@@ -51,12 +51,15 @@ namespace EchoBot.Media
         private readonly SpeechSynthesizer _synthesizer;
         private string _currentVoiceLang = string.Empty;
         private const string DefaultProcessingHint = "Please hold while I check ServiceNow.";
+        private const string IncidentIntelProcessingHint = "Please hold while I check ServiceNow. This may take a few seconds.";
         private const string AzureAdProcessingHint = "Please hold while I check Azure Active Directory.";
         private const string IntuneProcessingHint = "Please hold while I check Microsoft Intune.";
         private const string DefaultProcessingHintDe = "Bitte warten, während ich ServiceNow prüfe.";
+        private const string IncidentIntelProcessingHintDe = "Bitte warten, während ich ServiceNow prüfe. Das kann ein paar Sekunden dauern.";
         private const string AzureAdProcessingHintDe = "Bitte warten, während ich Azure Active Directory prüfe.";
         private const string IntuneProcessingHintDe = "Bitte warten, während ich Microsoft Intune prüfe.";
         private const string DefaultProcessingHintEs = "Por favor espera mientras reviso ServiceNow.";
+        private const string IncidentIntelProcessingHintEs = "Por favor espera mientras reviso ServiceNow. Esto puede tardar unos segundos.";
         private const string AzureAdProcessingHintEs = "Por favor espera mientras reviso Azure Active Directory.";
         private const string IntuneProcessingHintEs = "Por favor espera mientras reviso Microsoft Intune.";
         private Task _speechLoopTask;
@@ -700,6 +703,20 @@ namespace EchoBot.Media
 
             var lower = text.ToLowerInvariant();
             if (
+                lower.Contains("recurring incident")
+                || lower.Contains("recurring incidents")
+                || lower.Contains("repeated incident")
+                || lower.Contains("repeated incidents")
+                || lower.Contains("incident trends")
+                || lower.Contains("incident trend")
+                || lower.Contains("recurring issues")
+                || lower.Contains("repeated issues")
+                || lower.Contains("problems to focus")
+            )
+            {
+                return IncidentIntelProcessingHint;
+            }
+            if (
                 lower.Contains("intune")
                 || lower.Contains("device compliance")
                 || lower.Contains("managed device")
@@ -745,6 +762,10 @@ namespace EchoBot.Media
             var lang = (_currentVoiceLang ?? string.Empty).ToLowerInvariant();
             if (lang.StartsWith("de"))
             {
+                if (prompt == IncidentIntelProcessingHint)
+                {
+                    return IncidentIntelProcessingHintDe;
+                }
                 if (prompt == AzureAdProcessingHint)
                 {
                     return AzureAdProcessingHintDe;
@@ -757,6 +778,10 @@ namespace EchoBot.Media
             }
             if (lang.StartsWith("es"))
             {
+                if (prompt == IncidentIntelProcessingHint)
+                {
+                    return IncidentIntelProcessingHintEs;
+                }
                 if (prompt == AzureAdProcessingHint)
                 {
                     return AzureAdProcessingHintEs;
